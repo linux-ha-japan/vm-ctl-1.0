@@ -1,0 +1,1663 @@
+#!/bin/sh
+# -*- coding: utf-8 -*-
+
+# vm-ctl : Pacemaker virtualdomain resource  generator.
+#
+# Copyright (C) 2010 NIPPON TELEGRAPH AND TELEPHONE CORPORATION
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public
+# License as published by the Free Software Foundation; either
+# version 2.1 of the License, or (at your option) any later version.
+#
+# This software is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public
+# License along with this library; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+
+:<< '#_comment'
+変数説明
+大文字のみ              : global(vm-ctl)
+小文字のみ              : global(vm-ctl.conf)
+先頭にアンダースコア    : local (fuction)
+#_comment
+
+# global定数
+COM_NM="VMCTL"
+PRM_NM="prm${COM_NM}"
+LOC_NM="loc${COM_NM}"
+COL_NM="col${COM_NM}"
+ODR_NM="odr${COM_NM}"
+VMCFG_DIR="/etc"
+BACKUP_CRMFILE="/var/run/.vm-ctl.crm.bk"
+TMP_CRMFILE="/tmp/.vm-ctl.crm"
+VMCTL_LOGFILE="/tmp/.vm-ctl.log"
+PLUS_INFINITY="1000000"
+MINUS_INFINITY="-1000000"
+DEF_VALUE=""
+DC_NODE=""
+DEL_ID_LIST=""
+
+# output messages
+VMCTL_MSG01="pacemakerが停止しています"
+VMCTL_MSG02="設定ファイルが存在しません"
+VMCTL_MSG03="ドメインが存在しません"
+VMCTL_MSG04="一時ファイルが作成できないため、継続できません"
+VMCTL_MSG05="予期せぬエラーが発生しました"
+VMCTL_MSG06="仮想マシン定義ファイルディレクトリが設定されていません"
+VMCTL_MSG07="ライブマイグレーションの設定に誤りがあります"
+VMCTL_MSG08="STONITHの設定に誤りがあります"
+VMCTL_MSG09="pingd制約の設定に誤りがあります"
+VMCTL_MSG10="diskd制約の設定に誤りがあります"
+VMCTL_MSG11="リソース追加済みのドメインが指定されています"
+VMCTL_MSG12="stonith-enabledの設定がありません"
+VMCTL_MSG13="リソースが起動中の為、削除できません"
+VMCTL_MSG14="移動先のノードがOnlineではありません"
+VMCTL_MSG15="リソースが存在しません"
+VMCTL_MSG16="ノードが存在しません"
+VMCTL_MSG17="vm-ctlは実行中です"
+VMCTL_MSG18="リソースが起動していない為、移動を実行できません"
+VMCTL_MSG19='${DOMAIN_LIST}は、指定のノードに移動できない状態になっています'
+VMCTL_MSG20='${DOMAIN_LIST}は、移動可能なノードがありません'
+VMCTL_MSG21="移動元と移動先のノードの指定が同じな為、移動は実行されません"
+VMCTL_MSG22='vm-ctl.confの設定項目にミスがあるため、デフォルト値[${DEF_VALUE}]を使用します'
+VMCTL_MSG23="vm-managerd制約の設定に誤りがあります"
+VMCTL_MSG24="vm-stonithd制約の設定に誤りがあります"
+VMCTL_MSG25="リソースがunmanaged状態です"
+VMCTL_MSG26="リソースの移動が実行できませんでした"
+VMCTL_MSG27="リソースの移動に失敗しました"
+
+:<<'#_comment'
+関数名      : usage
+引数        : なし
+戻り値      : なし
+説明        : usageを出力し、vm-ctlを終了する
+#_comment
+usage()
+{
+    echo "usage:"
+    echo "vm-ctl resource add    <domain_name>[,<domain_name>] -a <active_node> [-m on|off]"
+    echo "vm-ctl resource delete <domain_name>[,<domain_name>]"
+    echo "vm-ctl resource start  <domain_name>[,<domain_name>]"
+    echo "vm-ctl resource stop   <domain_name>[,<domain_name>]"
+    echo "vm-ctl resource move   <domain_name> [-n <node_name>]"
+    echo "vm-ctl resource unmove <domain_name>"
+    echo "vm-ctl resource list   [domain_name|-n node_name]"
+    echo "vm-ctl location move   <domain_name>|-b <node_name>"
+    exit 1
+}
+
+:<<'#_comment'
+関数名      : rm_file
+引数        : ファイル名
+戻り値      : なし
+説明        : 指定ファイルを削除する
+#_comment
+rm_file()
+{
+    rm -rf ${1} >/dev/null 2>&1
+}
+
+:<<'#_comment'
+関数名      : chk_opt
+引数        : なし
+戻り値      : なし
+説明        : オプションのパラメータが省略されていないか確認し、
+			  省略されている場合、usageを出力し終了する。
+#_comment
+chk_opt()
+{
+	if [ "${OPTARG:0:1}" = "-" ] ; then
+		usage
+	fi
+	if [ ! "${OPTARG}" ] ; then
+		usage
+	fi
+}
+
+:<<'#_comment'
+関数名      : chk_vm
+引数        : なし
+戻り値      : なし
+説明        : 指定されたドメイン名が、ハイパーバイザー上に存在するか確認し、
+              存在しない場合、メッセージを出力し、vm-ctlを終了する
+#_comment
+chk_vm()
+{
+    local _domain_name
+    local _cnt
+    for _domain_name in ${DOMAIN_LIST}
+    do
+        _cnt=$(virsh list --all 2>/dev/null | grep -w ${_domain_name} 2>/dev/null | wc -l 2>/dev/null)
+        if [ ${_cnt} -eq 0 ] ; then
+            echo ${VMCTL_MSG03}
+            exit 1
+        fi
+    done
+}
+
+:<<'#_comment'
+関数名      : chk_rsc
+引数        : $1    判定方法(0:無 1:有)
+              $2    出力メッセージ
+戻り値      : なし
+説明        : 指定されたドメイン名が、リソース登録されているか確認し、
+              $1の判定方法に一致しなかった場合、メッセージを出力し、vm-ctlを終了する
+#_comment
+chk_rsc()
+{
+    local _domain_name
+    local _cnt
+    for _domain_name in ${DOMAIN_LIST}
+    do
+        _cnt=$(grep "primitive ${PRM_NM}_${_domain_name}" ${BACKUP_CRMFILE} 2>/dev/null | wc -l 2>/dev/null)
+        if [ ${_cnt} -ne ${1} ] ; then
+            echo ${2}
+            exit 1
+        fi
+    done
+}
+
+:<<'#_comment'
+関数名      : chk_domain_list
+引数        : なし
+戻り値      : なし
+説明        : ドメインリストの指定が無い場合、usageを出力し、vm-ctlを終了する
+#_comment
+chk_domain_list()
+{
+    if [ ! ${DOMAIN_LIST//,/} ] ; then
+        usage
+    fi
+}
+
+:<<'#_comment'
+関数名      : chk_domain
+引数        : なし
+戻り値      : なし
+説明        : ドメインの指定が不正な場合、usageを出力し、vm-ctlを終了する
+#_comment
+chk_domain()
+{
+    local _tmp=${DOMAIN_LIST//,/}
+    if [ ${#_tmp} -ne ${#DOMAIN_LIST} -o ! "${DOMAIN_LIST}" ] ; then
+        usage
+    fi
+}
+
+:<<'#_comment'
+関数名      : chk_onoff
+引数        : $1    判定文字列
+              $2    配列番号
+              $3	出力メッセージ
+戻り値      : なし
+説明        : on/off判定を行い、RET_VALUE(global)に値を設定する
+#_comment
+chk_onoff()
+{
+    local _onvalue=(true fence)
+    local _offvalue=(false block)
+    RET_VALUE=""
+    if [ "${1}" = "on" ] ; then
+        RET_VALUE=${_onvalue[${2}]}
+    elif [  "${1}" = "off" ] ; then
+        RET_VALUE=${_offvalue[${2}]}
+    else
+        echo ${3}
+        exit 1
+    fi
+}
+
+:<<'#_comment'
+関数名      : chk_stonith
+引数        : なし
+戻り値      : なし
+説明        : リソース情報にstonith-enabledの設定があるかどうか確認し、
+			  設定が無い場合、ログを出力し、終了する
+#_comment
+chk_stonith()
+{
+    local _cnt
+    _cnt=$(grep "stonith-enabled=" ${BACKUP_CRMFILE} 2>/dev/null | wc -l 2>/dev/null)
+    if [ ${_cnt} -eq 0 ] ; then
+        echo ${VMCTL_MSG12}
+        exit 1
+    fi
+}
+
+:<<'#_comment'
+関数名      : chk_crm_error
+引数        : $1    コマンドの戻り値
+戻り値      : なし
+説明        : crmコマンドがエラーかどうか判定し、エラーの場合、vm-ctlを終了する。
+#_comment
+chk_crm_error()
+{
+    local _cnt
+    _cnt=$(egrep 'ERROR|error' ${VMCTL_LOGFILE} 2>/dev/null | wc -l 2>/dev/null)
+    if [ ${_cnt} -ne 0 -o ${1} -ne 0 ] ; then
+        echo ${VMCTL_MSG05}
+        cat ${VMCTL_LOGFILE}
+        exit 1
+    fi
+}
+
+:<<'#_comment'
+関数名      : chk_cluster
+引数        : なし
+戻り値      : なし
+説明        : pacemaker起動チェック
+              crmコマンド実行前に必ず呼び出し、起動中以外であれば
+              メッセージを出力し、vm-ctlを終了する
+#_comment
+chk_cluster()
+{
+    local _ret
+    local _tmp
+    DC_NODE=""
+    _tmp=$(crmadmin -D -t ${crmadmin_timeout} 2>&1)
+    _ret=${?}
+    if [ ${_ret} -eq 254 ] ; then
+        echo ${VMCTL_MSG01}
+        exit 1
+    fi
+    if [ ${_ret} -ne 0 ] ; then
+        echo ${VMCTL_MSG05}
+        exit 1
+    fi
+    DC_NODE=$(echo ${_tmp} 2>&1 | awk '{print $4}' 2>&1)
+    while true
+    do
+        _tmp=$(crmadmin -S ${DC_NODE} -t ${crmadmin_timeout} 2>&1)
+        _ret=${?}
+        if [ ${_ret} -ne 0 ] ; then
+            echo ${VMCTL_MSG05}
+            exit 1
+        fi
+        echo ${_tmp} | grep "S_IDLE" -qs
+        _ret=${?}
+        if [ ${_ret} -eq 0 ] ; then
+            break
+        fi
+        sleep 1
+    done
+}
+
+:<<'#_comment'
+関数名      : chk_base_config
+引数        : なし
+戻り値      : なし
+説明        : vm-ctl.conf基本設定内容チェック
+              vm-ctl.confの基本設定内容(ユーザ任意)をチェックし
+              不正であれば、メッセージを出力し、vm-ctlを終了する
+#_comment
+chk_base_config()
+{
+    local _idx
+    local _val1
+    local _val
+    # dumpxml設定チェック
+    if [ ! ${vm_cfg_dir} ] ; then
+        echo ${VMCTL_MSG06}
+        exit 1
+    fi
+
+    # migrate設定チェック(コマンドオプション指定なしの場合)
+    if [ ! "${MIGRATE}" ] ; then
+    	MIGRATE=${vm_allow_migrate}
+    fi
+    chk_onoff "${MIGRATE}" 0 ${VMCTL_MSG07}
+    MIGRATE=${RET_VALUE}
+
+    # stonith設定チェック
+    chk_onoff "${vm_stonith}" 1 ${VMCTL_MSG08}
+    STONITH=${RET_VALUE}
+
+    # 無限ループにならないように、上限10個
+    _idx=1
+    while [ ${_idx} -le 10 ]
+    do
+        _val1="_val1=\${vm_pingd${_idx}[@]}"
+        eval $_val1
+        _val=($_val1)
+        _val1="${_val[@]}"
+        if [ ! "${_val1}" ] ; then
+            break
+        fi
+        # パラメータ数チェック
+        if [ ${#_val[@]} -ne 1 -a ${#_val[@]} -ne 2 ] ; then
+            echo ${VMCTL_MSG09}
+            exit 1
+        fi
+        _idx=$(expr ${_idx} + 1)
+    done
+
+    # 無限ループにならないように、上限10個
+    _idx=1
+    while [ ${_idx} -le 10 ]
+    do
+        _val1="_val1=\${vm_diskd${_idx}[@]}"
+        eval $_val1
+        _val=($_val1)
+        _val1="${_val[@]}"
+        if [ ! "${_val1}" ] ; then
+            break
+        fi
+        # パラメータ数チェック
+        if [ ${#_val[@]} -ne 1 -a ${#_val[@]} -ne 2  ] ; then
+            echo ${VMCTL_MSG10}
+            exit 1
+        fi
+        _idx=$(expr ${_idx} + 1)
+    done
+
+    # 無限ループにならないように、上限10個
+    _idx=1
+    while [ ${_idx} -le 10 ]
+    do
+        _val1="_val1=\${vm_managerd${_idx}[@]}"
+        eval $_val1
+        _val=($_val1)
+        _val1="${_val[@]}"
+        if [ ! "${_val1}" ] ; then
+            break
+        fi
+        # パラメータ数チェック
+        if [ ${#_val[@]} -ne 1 -a ${#_val[@]} -ne 2  ] ; then
+            echo ${VMCTL_MSG23}
+            exit 1
+        fi
+        _idx=$(expr ${_idx} + 1)
+    done
+
+    # 無限ループにならないように、上限10個
+    _idx=1
+    while [ ${_idx} -le 10 ]
+    do
+        _val1="_val1=\${vm_stonithd${_idx}[@]}"
+        eval $_val1
+        _val=($_val1)
+        _val1="${_val[@]}"
+        if [ ! "${_val1}" ] ; then
+            break
+        fi
+        # パラメータ数チェック
+        if [ ${#_val[@]} -ne 1  ] ; then
+            echo ${VMCTL_MSG24}
+            exit 1
+        fi
+        _idx=$(expr ${_idx} + 1)
+    done
+}
+
+:<<'#_comment'
+関数名      : chk_rsc_config
+引数        : なし
+戻り値      : なし
+説明        : vm-ctl.confのリソースオペレーションを確認する
+			  指定がないなどあれば、強制的に初期内容に設定する
+#_comment
+chk_rsc_config()
+{
+	if [ ! "${vm_hypervisor}" ] ; then
+		DEF_VALUE="vm_hypervisor=qemu:///system"
+                eval echo "${VMCTL_MSG22}"
+                eval ${DEF_VALUE}
+	fi
+	if [ ! "${vm_migration_transport}" ] ; then
+                DEF_VALUE="vm_migration_transport=ssh"
+                eval echo "${VMCTL_MSG22}"
+                eval ${DEF_VALUE}
+	fi
+
+	if [ ! "${vm_start_op}" -o ${#vm_start_op[@]} -ne 3 ] ; then
+                DEF_VALUE="vm_start_op=(0 120s restart)"
+                eval echo "${VMCTL_MSG22}"
+                eval ${DEF_VALUE}
+	fi
+	if [ ! "${vm_stop_op}" -o ${#vm_stop_op[@]} -ne 2 ] ; then
+                DEF_VALUE="vm_stop_op=(0 90s)"
+                eval echo "${VMCTL_MSG22}"
+                eval ${DEF_VALUE}
+	fi
+	if [ ! "${vm_monitor_op}" -o ${#vm_monitor_op[@]} -ne 3 ] ; then
+                DEF_VALUE="vm_monitor_op=(10s 30s restart)"
+                eval echo "${VMCTL_MSG22}"
+                eval ${DEF_VALUE}
+	fi
+	if [ ! "${vm_migrate_to_op}" -o ${#vm_migrate_to_op[@]} -ne 2 ] ; then
+                DEF_VALUE="vm_migrate_to_op=(0 300s)"
+                eval echo "${VMCTL_MSG22}"
+                eval ${DEF_VALUE}
+	fi
+	if [ ! "${vm_migrate_from_op}" -o ${#vm_migrate_from_op[@]} -ne 3 ] ; then
+                DEF_VALUE="vm_migrate_from_op=(0 240s restart)"
+                eval echo "${VMCTL_MSG22}"
+                eval ${DEF_VALUE}
+	fi
+
+	if [ ! "${vm_node_loc_act}" ] ; then
+                DEF_VALUE="vm_node_loc_act=200"
+                eval echo "${VMCTL_MSG22}"
+                eval ${DEF_VALUE}
+	fi
+	if [ ! "${vm_pingd_loc}" -o ${#vm_pingd_loc[@]} -ne 2 ] ; then
+                DEF_VALUE="vm_pingd_loc=(lt 100)"
+                eval echo "${VMCTL_MSG22}"
+                eval ${DEF_VALUE}
+	fi
+	if [ ! "${vm_pingd_col}" ] ; then
+                DEF_VALUE="vm_pingd_col=INFINITY"
+                eval echo "${VMCTL_MSG22}"
+                eval ${DEF_VALUE}
+	fi
+	if [ ! "${vm_pingd_odr}" -o ${#vm_pingd_odr[@]} -ne 2 ] ; then
+                DEF_VALUE="vm_pingd_odr=(0 false)"
+                eval echo "${VMCTL_MSG22}"
+                eval ${DEF_VALUE}
+	fi
+	if [ ! "${vm_diskd_loc}" -o ${#vm_diskd_loc[@]} -ne 2 ] ; then
+                DEF_VALUE="vm_diskd_loc=(eq ERROR)"
+                eval echo "${VMCTL_MSG22}"
+                eval ${DEF_VALUE}
+	fi
+	if [ ! "${vm_diskd_col}" ] ; then
+                DEF_VALUE="vm_diskd_col=INFINITY"
+                eval echo "${VMCTL_MSG22}"
+                eval ${DEF_VALUE}
+	fi
+	if [ ! "${vm_diskd_odr}" -o ${#vm_diskd_odr[@]} -ne 2 ] ; then
+                DEF_VALUE="vm_diskd_odr=(0 false)"
+                eval echo "${VMCTL_MSG22}"
+                eval ${DEF_VALUE}
+	fi
+	if [ ! "${vm_managerd_loc}" -o ${#vm_managerd_loc[@]} -ne 2 ] ; then
+                DEF_VALUE="vm_managerd_loc=(eq ERROR)"
+                eval echo "${VMCTL_MSG22}"
+                eval ${DEF_VALUE}
+	fi
+	if [ ! "${vm_managerd_col}" ] ; then
+                DEF_VALUE="vm_managerd_col=INFINITY"
+                eval echo "${VMCTL_MSG22}"
+                eval ${DEF_VALUE}
+	fi
+	if [ ! "${vm_managerd_odr}" -o ${#vm_managerd_odr[@]} -ne 2 ] ; then
+                DEF_VALUE="vm_managerd_odr=(0 false)"
+                eval echo "${VMCTL_MSG22}"
+                eval ${DEF_VALUE}
+	fi
+	if [ ! "${vm_stonithd_col}" ] ; then
+                DEF_VALUE="vm_stonithd_col=INFINITY"
+                eval echo "${VMCTL_MSG22}"
+                eval ${DEF_VALUE}
+	fi
+	if [ ! "${vm_stonithd_odr}" -o ${#vm_stonithd_odr[@]} -ne 2 ] ; then
+                DEF_VALUE="vm_stonithd_odr=(0 false)"
+                eval echo "${VMCTL_MSG22}"
+                eval ${DEF_VALUE}
+	fi
+}
+
+:<<'#_comment'
+関数名      : get_domain
+引数        : なし
+戻り値      : なし
+説明        : primitive情報からドメインのリストを取得する
+#_comment
+get_domain()
+{
+    RET_VALUE=""
+    RET_VALUE=$(grep "primitive ${PRM_NM}.*VirtualDomain" ${BACKUP_CRMFILE} 2>/dev/null    \
+                | awk '{print substr($2,length("'${PRM_NM}'_")+1)}' 2>/dev/null)
+}
+
+:<<'#_comment'
+関数名      : get_migrate
+引数        : $1    リソース名
+戻り値      : なし
+説明        : primitive情報からマイグレーション設定を取得する
+#_comment
+get_migrate()
+{
+    local _line
+    local _migrate
+    RET_VALUE=""
+    while read _line
+    do
+        _migrate=$(echo ${_line} 2>/dev/null        \
+                | grep "primitive ${1}" 2>/dev/null \
+                | sed -e 's/.*allow-migrate=\"\(true\|false\)\" .*/\1/' 2>/dev/null)
+        if [ "${_migrate}" ] ; then
+            if [ "${_migrate}" = "true" ] ; then
+                RET_VALUE="on"
+            elif [ "${_migrate}" = "false" ] ; then
+                RET_VALUE="off"
+            fi
+            break
+        fi
+    done < ${BACKUP_CRMFILE}
+}
+
+:<<'#_comment'
+関数名      : get_act_location
+引数        : $1    ドメイン名
+戻り値      : なし
+説明        : location情報からリソースの優先ノードの情報を取得する
+#_comment
+get_act_location()
+{
+    local _line
+    local _act
+    RET_VALUE=""
+    while read _line
+    do
+        _act=$(echo ${_line} 2>/dev/null        \
+                | grep "location ${LOC_NM}_${1}.*ACT" 2>/dev/null \
+                | awk '{print $5}')
+        if [ "${_act}" ] ; then
+            RET_VALUE=${_act}
+            break
+        fi
+    done < ${BACKUP_CRMFILE}
+}
+
+:<<'#_comment'
+関数名      : get_move_location
+引数        : $1    リソース名
+戻り値      : なし
+説明        : location情報から移動制約の情報を取得する
+#_comment
+get_move_location()
+{
+    local _line
+    RET_VALUE="no"
+    while read _line
+    do
+        _migrate=$(echo ${_line} 2>/dev/null        \
+                | egrep "location cli-standby-${1}|location cli-prefer-${1}" 2>/dev/null)
+        if [ ${?} -eq 0 ] ; then
+            RET_VALUE="yes"
+        fi
+    done < ${BACKUP_CRMFILE}
+}
+
+:<<'#_comment'
+関数名      : cre_node_location
+引数        : $1    ドメイン名
+              $2    スコア値
+              $3    ノード名
+戻り値      : なし
+説明        : crm形式で、node locationを作成する
+
+location locVMCTL_dom-a1_x3650c_ACT prmVMCTL_dom-a1 200: x3650c
+#_comment
+cre_node_location()
+{
+    echo "location ${LOC_NM}_${1}_${3}_ACT ${PRM_NM}_${1} ${2}: ${3}
+" >> ${TMP_CRMFILE}
+}
+
+:<<'#_comment'
+関数名      : cre_pingd_location
+引数        : $1    ドメイン名
+              $2    属性名
+戻り値      : なし
+説明        : crm形式で、pingd用のlocationを作成する
+
+location locVMCTL_dom-a1_default_ping_set prmVMCTL_dom-a1 \
+        rule $id="locVMCTL_dom-a1_default_ping_set-rule" -inf: not_defined default_ping_set or default_ping_set lt 100
+#_comment
+cre_pingd_location()
+{
+    echo "location ${LOC_NM}_${1}_${2} ${PRM_NM}_${1} rule -inf: not_defined ${2} or ${2} ${vm_pingd_loc[@]}
+" >> ${TMP_CRMFILE}
+}
+
+:<<'#_comment'
+関数名      : cre_pingd_order
+引数        : $1    ドメイン名
+              $2    リソース名
+戻り値      : なし
+説明        : crm形式で、pingd用のorderを作成する
+
+order odrVMCTL_dom-a1_clnPingd 0: clnPingd prmVMCTL_dom-a1 symmetrical=false
+#_comment
+cre_pingd_order()
+{
+    echo "order ${ODR_NM}_${1}_${2} ${vm_pingd_odr[0]}: ${2} ${PRM_NM}_${1} symmetrical=${vm_pingd_odr[1]}
+" >> ${TMP_CRMFILE}
+}
+
+:<<'#_comment'
+関数名      : cre_pingd_colocation
+引数        : $1    ドメイン名
+              $2    リソース名
+戻り値      : なし
+説明        : crm形式で、pingd用のcolocationを作成する
+
+colocation colVMCTL_dom-a1_clnPingd inf: prmVMCTL_dom-a1 clnPingd
+#_comment
+cre_pingd_colocation()
+{
+   echo "colocation ${COL_NM}_${1}_${2} ${vm_pingd_col}: ${PRM_NM}_${1} ${2}" >> ${TMP_CRMFILE}
+}
+
+:<<'#_comment'
+関数名      : cre_pingd
+引数        : $1    ドメイン名
+戻り値      : なし
+説明        : crm形式で、pingd用のlocation/colocation/orderを作成する
+#_comment
+cre_pingd()
+{
+    local _val
+    local _val1
+    local _idx=1
+    while [ ${_idx} -le 10 ]
+    do
+        _val1="_val1=\${vm_pingd${_idx}[@]}"
+        eval ${_val1}
+        _val=(${_val1})
+        _val1="${_val[@]}"
+        if [ ! "${_val1}" ] ; then
+            break
+        fi
+        if [ -n "${_val[1]}" ] ; then
+            cre_pingd_location ${1} ${_val[1]}
+        fi
+        cre_pingd_colocation ${1} ${_val[0]}
+        cre_pingd_order ${1} ${_val[0]}
+        _idx=$(expr ${_idx} + 1)
+    done
+}
+
+:<<'#_comment'
+関数名      : cre_diskd_location
+引数        : $1    ドメイン名
+              $2    属性名
+戻り値      : なし
+説明        : crm形式で、diskd用のlocationを作成する
+
+location locVMCTL_dom-a1_diskcheck_status prmVMCTL_dom-a1 \
+        rule $id="locVMCTL_dom-a1_diskcheck_status-rule" -inf: not_defined diskcheck_status or diskcheck_status eq ERROR
+#_comment
+cre_diskd_location()
+{
+    echo "location ${LOC_NM}_${1}_${2} ${PRM_NM}_${1} rule -inf: not_defined ${2} or ${2} ${vm_diskd_loc[@]}
+" >> ${TMP_CRMFILE}
+}
+
+:<<'#_comment'
+関数名      : cre_diskd_order
+引数        : $1    ドメイン名
+              $2    リソース名
+戻り値      : なし
+説明        : crm形式で、pingd用のorderを作成する
+
+order odrVMCTL_dom-a1_clnDiskd1 0: clnDiskd1 prmVMCTL_dom-a1 symmetrical=false
+#_comment
+cre_diskd_order()
+{
+    echo "order ${ODR_NM}_${1}_${2} ${vm_diskd_odr[0]}: ${2} ${PRM_NM}_${1} symmetrical=${vm_diskd_odr[1]}
+" >> ${TMP_CRMFILE}
+}
+
+:<<'#_comment'
+関数名      : cre_diskd_colocation
+引数        : $1    ドメイン名
+              $2    リソース名
+戻り値      : なし
+説明        : crm形式で、diskd用のcolocationを作成する
+
+colocation colVMCTL_dom-a1_clnDiskd1 inf: prmVMCTL_dom-a1 clnDiskd1
+#_comment
+cre_diskd_colocation()
+{
+   echo "colocation ${COL_NM}_${1}_${2} ${vm_diskd_col}: ${PRM_NM}_${1} ${2}" >> ${TMP_CRMFILE}
+}
+
+:<<'#_comment'
+関数名      : cre_diskd
+引数        : $1    ドメイン名
+戻り値      : なし
+説明        : crm形式で、diskd用のlocation/colocation/orderを作成する
+#_comment
+cre_diskd()
+{
+    local _val
+    local _val1
+    local _idx=1
+    while [ ${_idx} -le 10 ]
+    do
+        _val1="_val1=\${vm_diskd${_idx}[@]}"
+        eval ${_val1}
+        _val=(${_val1})
+        _val1="${_val[@]}"
+        if [ ! "${_val1}" ] ; then
+            break
+        fi
+        if [ -n "${_val[1]}" ] ; then
+            cre_diskd_location ${1} ${_val[1]}
+        fi
+        cre_diskd_colocation ${1} ${_val[0]}
+        cre_diskd_order ${1} ${_val[0]}
+        _idx=$(expr ${_idx} + 1)
+    done
+}
+
+:<<'#_comment'
+関数名      : cre_managerd_location
+引数        : $1    ドメイン名
+              $2    属性名
+戻り値      : なし
+説明        : crm形式で、vm-managerd用のlocationを作成する
+
+location locVMCTL_dom-a1_operator_check_status prmVMCTL_dom-a1 \
+        rule $id="locVMCTL_dom-a1_operator_check_status-rule" -inf: not_defined operator_check_status or operator_check_status eq ERROR
+#_comment
+cre_managerd_location()
+{
+    echo "location ${LOC_NM}_${1}_${2} ${PRM_NM}_${1} rule -inf: not_defined ${2} or ${2} ${vm_managerd_loc[@]}
+" >> ${TMP_CRMFILE}
+}
+
+:<<'#_comment'
+関数名      : cre_managerd_order
+引数        : $1    ドメイン名
+              $2    リソース名
+戻り値      : なし
+説明        : crm形式で、vm-managerd用のorderを作成する
+
+order odrVMCTL_dom-a1_clnVmManagerd 0: clnVmManagerd prmVMCTL_dom-a1 symmetrical=false
+#_comment
+cre_managerd_order()
+{
+    echo "order ${ODR_NM}_${1}_${2} ${vm_managerd_odr[0]}: ${2} ${PRM_NM}_${1} symmetrical=${vm_managerd_odr[1]}
+" >> ${TMP_CRMFILE}
+}
+
+:<<'#_comment'
+関数名      : cre_managerd_colocation
+引数        : $1    ドメイン名
+              $2    リソース名
+戻り値      : なし
+説明        : crm形式で、vm-managerd用のcolocationを作成する
+
+colocation colVMCTL_dom-b1_clnVmManagerd inf: prmVMCTL_dom-b1 clnVmManagerd
+#_comment
+cre_managerd_colocation()
+{
+   echo "colocation ${COL_NM}_${1}_${2} ${vm_managerd_col}: ${PRM_NM}_${1} ${2}" >> ${TMP_CRMFILE}
+}
+
+:<<'#_comment'
+関数名      : cre_managerd
+引数        : $1    ドメイン名
+戻り値      : なし
+説明        : crm形式で、vm-managerd用のlocation/colocation/orderを作成する
+#_comment
+cre_managerd()
+{
+    local _val
+    local _val1
+    local _idx=1
+    while [ ${_idx} -le 10 ]
+    do
+        _val1="_val1=\${vm_managerd${_idx}[@]}"
+        eval ${_val1}
+        _val=(${_val1})
+        _val1="${_val[@]}"
+        if [ ! "${_val1}" ] ; then
+            break
+        fi
+        if [ -n "${_val[1]}" ] ; then
+            cre_managerd_location ${1} ${_val[1]}
+        fi
+        cre_managerd_colocation ${1} ${_val[0]}
+        cre_managerd_order ${1} ${_val[0]}
+        _idx=$(expr ${_idx} + 1)
+    done
+}
+
+:<<'#_comment'
+関数名      : cre_stonithd_order
+引数        : $1    ドメイン名
+              $2    リソース名
+戻り値      : なし
+説明        : crm形式で、vm-stonithd用のorderを作成する
+
+order odrVMCTL_dom-b1_clnVmStonithd 0: clnVmStonithd prmVMCTL_dom-b1 symmetrical=false
+#_comment
+cre_stonithd_order()
+{
+    echo "order ${ODR_NM}_${1}_${2} ${vm_stonithd_odr[0]}: ${2} ${PRM_NM}_${1} symmetrical=${vm_stonithd_odr[1]}
+" >> ${TMP_CRMFILE}
+}
+
+:<<'#_comment'
+関数名      : cre_stonithd_colocation
+引数        : $1    ドメイン名
+              $2    リソース名
+戻り値      : なし
+説明        : crm形式で、vm-stonithd用のcolocationを作成する
+
+colocation colVMCTL_dom-b1_clnVmStonithd inf: prmVMCTL_dom-b1 clnVmStonithd
+#_comment
+cre_stonithd_colocation()
+{
+   echo "colocation ${COL_NM}_${1}_${2} ${vm_stonithd_col}: ${PRM_NM}_${1} ${2}" >> ${TMP_CRMFILE}
+}
+
+:<<'#_comment'
+関数名      : cre_stonithd
+引数        : $1    ドメイン名
+戻り値      : なし
+説明        : crm形式で、vm-stonithd用のcolocation/orderを作成する
+#_comment
+cre_stonithd()
+{
+    local _val
+    local _val1
+    local _idx=1
+    while [ ${_idx} -le 10 ]
+    do
+        _val1="_val1=\${vm_stonithd${_idx}[@]}"
+        eval ${_val1}
+        _val=(${_val1})
+        _val1="${_val[@]}"
+        if [ ! "${_val1}" ] ; then
+            break
+        fi
+        cre_stonithd_colocation ${1} ${_val[0]}
+        cre_stonithd_order ${1} ${_val[0]}
+        _idx=$(expr ${_idx} + 1)
+    done
+}
+
+:<<'#_comment'
+関数名      : cre_crm_resource
+引数        : $1    リソース名
+              $2    ノード名
+戻り値      : なし
+説明        : crm形式でリソース情報を作成する。
+
+primitive prmVMCTL_dom-a1 ocf:extra:VirtualDomain \
+    params config="/etc/libvirt/qmue/dom-a1.xml" hypervisor="qemu:///system" migration_transport="ssh" \
+    meta target-role="Stopped" meta allow-migrate="true" \
+    op start interval="0" timeout="120s" on-fail="restart" \
+    op monitor interval="10s" timeout="30s" on-fail="restart" \
+    op stop interval="0" timeout="90s" on-fail="block" \
+    op migrate_to interval="0" timeout="120s" on-fail="restart" \
+    op migrate_from interval="0" timeout="60s" on-fail="block"
+#_comment
+cre_crm_resource()
+{
+    echo "primitive ${PRM_NM}_${1} ${vm_ocf} \\
+    params config=\"${vm_cfg_dir}/${1}${vm_cfg_ext}\" hypervisor=\"${vm_hypervisor}\" migration_transport=\"${vm_migration_transport}\" \\
+    meta allow-migrate=\"${MIGRATE}\" target-role=\"Stopped\" \\
+    op start interval=\"${vm_start_op[0]}\" timeout=\"${vm_start_op[1]}\" on-fail=\"${vm_start_op[2]}\" \\
+    op monitor interval=\"${vm_monitor_op[0]}\" timeout=\"${vm_monitor_op[1]}\" on-fail=\"${vm_monitor_op[2]}\" \\
+    op stop interval=\"${vm_stop_op[0]}\" timeout=\"${vm_stop_op[1]}\" on-fail=\"${STONITH}\" \\
+    op migrate_to interval=\"${vm_migrate_to_op[0]}\" timeout=\"${vm_migrate_to_op[1]}\" on-fail=\"${STONITH}\" \\
+    op migrate_from interval=\"${vm_migrate_from_op[0]}\" timeout=\"${vm_migrate_from_op[1]}\" on-fail=\"${vm_migrate_from_op[2]}\"
+" >> ${TMP_CRMFILE}
+
+    # location/order作成
+    cre_node_location ${1} ${vm_node_loc_act} ${2}
+    cre_pingd ${1}
+    cre_diskd ${1}
+    cre_managerd ${1}
+    cre_stonithd ${1}
+}
+
+:<<'#_comment'
+関数名      : crm_get_actrsc_node
+引数        : $1    リソース名
+戻り値      : なし
+説明        : リソースが起動しているノードを取得する
+              ※リソースが起動していない場合は、NULLが設定される
+
+ crm status inactive
+ prmdom-a1      (ocf::heartbeat:Dummy): Started x3650c
+ prmdom-b1      (ocf::heartbeat:Dummy): Stopped
+#_comment
+crm_get_actrsc_node()
+{
+    RET_VALUE=""
+    chk_cluster
+    RET_VALUE=$(crm status inactive 2>/dev/null     \
+            | grep ${1}.*VirtualDomain 2>/dev/null  \
+            | awk '{print $4}' 2>/dev/null)
+}
+
+:<<'#_comment'
+関数名      : crm_get_node_rsclist
+引数        : $1    ノード名
+戻り値      : なし
+説明        : 指定ノード上で起動しているリソースのリストを取得する
+              * リソースが1つも起動していない場合は、NULLが設定される
+
+ crm status inactive
+ prmdom-a1      (ocf::heartbeat:Dummy): Started x3650c
+ prmdom-b1      (ocf::heartbeat:Dummy): Stopped
+#_comment
+crm_get_node_rsclist()
+{
+    RET_VALUE=""
+    chk_cluster
+    RET_VALUE=$(crm status inactive 2>/dev/null     \
+            | grep VirtualDomain.*${1} 2>/dev/null  \
+            | awk '{print $1}' 2>/dev/null          \
+            | awk '{print substr($1,length("'${PRM_NM}'_")+1)}' 2>/dev/null)
+}
+
+:<<'#_comment'
+関数名      : crm_chk_str_resource
+引数        : $1    リソース名
+戻り値      : なし
+説明        : リソースの起動状態をチェックし、
+              起動中であれば、メッセージを出力し、vm-ctlを終了する
+#_comment
+crm_chk_str_resource()
+{
+    crm_get_actrsc_node ${1}
+    if [ "${RET_VALUE}" ] ; then
+        echo ${VMCTL_MSG13}
+        exit 1
+    fi
+}
+
+:<<'#_comment'
+関数名      : crm_chk_node
+引数        : $1    ノード名
+戻り値      : なし
+説明        : クラスタ構成に対象ノードが存在するか確認し、
+              存在しない場合、メッセージを出力し、vm-ctlを終了する
+#_comment
+crm_chk_node()
+{
+    local _cnt
+    chk_cluster
+    _cnt=$(crm node show ${1} 2>/dev/null    \
+            | wc -l 2>/dev/null)
+    if [ ${_cnt} -eq 0 ] ; then
+        echo ${VMCTL_MSG16}
+        exit 1
+    fi
+}
+
+:<<'#_comment'
+関数名      : crm_chk_can_move
+引数        : $1    ドメイン名
+            : $2    稼働元ノード名
+            : $3    移動先ノード名(非必須)
+戻り値      : 0:移動可
+	    : 1:移動不可
+説明        : リソースが指定ノード、または他ノードに移動可能か確認し、
+              移動が不可能だった場合、メッセージを出力し、リターンコードを返す
+#_comment
+crm_chk_can_move()
+{
+    local _cnt
+    local _scores
+    local _flg=0
+
+    if [ ${3} ] ; then
+        chk_cluster
+        _cnt=$(crm status 2>/dev/null                   \
+                | grep -v VirtualDomain 2>/dev/null     \
+                | grep "Online" 2>/dev/null             \
+                | grep ${3} 2>/dev/null                 \
+                | wc -l 2>/dev/null)
+        if [ ${_cnt} -eq 0 ] ; then
+            echo ${VMCTL_MSG14}
+            return 1
+        fi
+    fi
+    chk_cluster
+    crm status inactive 2>/dev/null     \
+            | grep ${PRM_NM}_${1}.*VirtualDomain 2>/dev/null  \
+            | egrep 'unmanaged' >/dev/null 2>&1
+    if [ ${?} -eq 0 ] ; then
+        echo ${VMCTL_MSG25}
+        return 1
+    fi
+    chk_cluster
+    _scores=$(crm configure ptest scores 2>/dev/null \
+        | grep "native_color: ${PRM_NM}_${1} allocation score on ${3}" 2>/dev/null \
+        | grep -v ${2} 2>/dev/null \
+        | awk '{print $7}' 2>/dev/null)
+
+    if [ ${3} ] ; then
+        if [ "${_scores}" = "${MINUS_INFINITY}" ] ; then
+            eval echo "${VMCTL_MSG19}"
+            return 1
+        fi
+    else
+        for _score in ${_scores}
+        do
+            if [ "${_score}" != "${MINUS_INFINITY}" ] ; then
+                _flg=1
+            fi
+        done
+        if [ ${_flg} -eq 0 ] ; then
+            eval echo "${VMCTL_MSG20}"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+:<<'#_comment'
+関数名      : crm_upd_resource
+引数        : なし
+戻り値      : なし
+説明        : crmファイルを更新する
+#_comment
+crm_upd_resource()
+{
+    local _cnt
+    if [ ! -e ${TMP_CRMFILE} ] ; then
+        return
+    fi
+    chk_cluster
+    crm configure load update ${TMP_CRMFILE}<<EOF>${VMCTL_LOGFILE} 2>&1
+no
+EOF
+    # エラーチェック
+    chk_crm_error ${?}
+}
+
+:<<'#_comment'
+関数名      : crm_del_resource
+引数        : $1    リソース名
+戻り値      : なし
+説明        : crmファイルから、対象となるリソース関連情報を削除する
+#_comment
+crm_del_resource()
+{
+    chk_cluster
+    crm configure delete ${1}<<EOF>>${VMCTL_LOGFILE} 2>&1
+no
+EOF
+    # エラーチェック
+    chk_crm_error ${?}
+}
+
+:<<'#_comment'
+関数名      : crm_str_resource
+引数        : $1    リソース名
+戻り値      : なし
+説明        : 対象となるリソースを起動する。
+#_comment
+crm_str_resource()
+{
+    chk_cluster
+    crm resource start ${1} >>${VMCTL_LOGFILE} 2>&1
+    # エラーチェック
+    chk_crm_error ${?}
+}
+
+:<<'#_comment'
+関数名      : crm_stp_resource
+引数        : $1    リソース名
+戻り値      : なし
+説明        : 対象となるリソースを停止する。
+#_comment
+crm_stp_resource()
+{
+    chk_cluster
+    crm resource stop ${1} >>${VMCTL_LOGFILE} 2>&1
+    # エラーチェック
+    chk_crm_error ${?}
+}
+
+:<<'#_comment'
+関数名      : crm_move_resource
+引数        : $1    ドメイン名
+            : $2    移動元ノード名
+            : $3    移動先ノード名
+戻り値      : なし
+説明        : 対象となるリソースを移動する。
+#_comment
+crm_move_resource()
+{
+    chk_cluster
+    # 移動用location作成＆実行
+    if [ ! "${3}" ] ; then
+         crm resource move ${PRM_NM}_${1} >>${VMCTL_LOGFILE} 2>&1
+    else
+         crm resource move ${PRM_NM}_${1} ${3} force >>${VMCTL_LOGFILE} 2>&1
+    fi
+    chk_crm_error ${?}
+    # リソース移動完了チェック
+    while true
+    do
+        crm_chk_can_move ${1} ${2} ${3}
+        if [ ${?} -eq 1 ] ; then
+            echo ${VMCTL_MSG27}
+            exit 1
+        fi
+        crm_get_actrsc_node ${PRM_NM}_${1}
+        if [ ! ${3} ] ; then
+            if [ ${RET_VALUE} -a "${RET_VALUE}" != "${2}" ] ; then
+                break
+            fi
+        else
+            if [ "${RET_VALUE}" = "${3}" ] ; then
+                break
+            fi
+        fi
+        sleep 1
+    done
+    # 移動用location削除
+    chk_cluster
+    crm resource unmove ${PRM_NM}_${1} >>${VMCTL_LOGFILE} 2>&1
+    chk_crm_error ${?}
+}
+
+:<<'#_comment'
+関数名      : crm_unmove_resource
+引数        : $1    リソース名
+戻り値      : なし
+説明        : 対象となるリソースの移動制約を解除する。
+#_comment
+crm_unmove_resource()
+{
+    chk_cluster
+    crm resource unmove ${1} >>${VMCTL_LOGFILE} 2>&1
+    # エラーチェック
+    chk_crm_error ${?}
+}
+
+:<<'#_comment'
+関数名      : crm_move_location
+引数        : $1    ドメイン名
+              $2    移動先ノード名
+戻り値      : なし
+説明        : 対象となるリソースのlocationを変更する。
+#_comment
+crm_move_location()
+{
+    # 現状のlocation取得
+    get_act_location ${1}
+    # 現状のlocationと設定ノードが同じなら何もしない
+    if [ "${2}" != "${RET_VALUE}" ] ; then
+        DEL_ID_LIST="${DEL_ID_LIST} ${LOC_NM}_${1}_${RET_VALUE}_ACT"
+        cre_node_location ${1} ${vm_node_loc_act} ${2}
+    fi
+}
+:<<'#_comment'
+関数名      : resource_add
+引数        : なし
+戻り値      : なし
+説明        : リソース追加する
+#_comment
+resource_add()
+{
+    local _domain_name
+
+    chk_vm
+    chk_rsc 0 ${VMCTL_MSG11}
+    chk_base_config
+    chk_stonith
+    # ノードチェック
+    crm_chk_node ${NODE_NAME}
+    # 対象のリソース情報を作成
+    for _domain_name in ${DOMAIN_LIST}
+    do
+        cre_crm_resource ${_domain_name} ${NODE_NAME}
+    done
+    # リソース情報更新
+    crm_upd_resource
+    # crmの結果をoutput
+    cat ${VMCTL_LOGFILE}
+}
+
+:<<'#_comment'
+関数名      : resource_delete
+引数        : なし
+戻り値      : なし
+説明        : リソースを削除する
+#_comment
+resource_delete()
+{
+    local _domain_name
+
+    chk_vm
+    chk_rsc 1 ${VMCTL_MSG15}
+    # 削除対象のリソースが停止しているか確認
+    for _domain_name in ${DOMAIN_LIST}
+    do
+        crm_chk_str_resource ${PRM_NM}_${_domain_name}
+    done
+    # 対象のリソースを削除
+    for _domain_name in ${DOMAIN_LIST}
+    do
+        DEL_ID_LIST="${DEL_ID_LIST} ${PRM_NM}_${_domain_name}"
+    done
+    crm_del_resource "${DEL_ID_LIST}"
+    # crmの結果をoutput
+#    cat ${VMCTL_LOGFILE} 2>/dev/null | grep -v 'INFO:.*_dom-a1_.* deleted' 2>/dev/null
+    cat ${VMCTL_LOGFILE} 2>/dev/null
+}
+
+:<<'#_comment'
+関数名      : resource_start
+引数        : なし
+戻り値      : なし
+説明        : リソースを起動する
+#_comment
+resource_start()
+{
+    local _domain_name
+
+    chk_vm
+    chk_rsc 1 ${VMCTL_MSG15}
+    # 対象のリソースを起動
+    for _domain_name in ${DOMAIN_LIST}
+    do
+        crm_str_resource ${PRM_NM}_${_domain_name}
+    done
+}
+
+:<<'#_comment'
+関数名      : resource_stop
+引数        : なし
+戻り値      : なし
+説明        : リソースを停止する
+#_comment
+resource_stop()
+{
+    local _domain_name
+
+    chk_vm
+    chk_rsc 1 ${VMCTL_MSG15}
+    # 対象のリソースを停止
+    for _domain_name in ${DOMAIN_LIST}
+    do
+        crm_stp_resource ${PRM_NM}_${_domain_name}
+    done
+}
+
+:<<'#_comment'
+関数名      : resource_move
+引数        : なし
+戻り値      : なし
+説明        : 指定ノードにリソースを移動する
+#_comment
+resource_move()
+{
+    local _to=${NODE_NAME}
+    local _from
+
+    chk_vm
+    chk_rsc 1 ${VMCTL_MSG15}
+    # 稼動中のノード名を取得
+    crm_get_actrsc_node ${PRM_NM}_${DOMAIN_LIST}
+    _from=${RET_VALUE}
+    # 稼動中のノードが存在しない場合エラー
+    if [ ! "${_from}" ] ; then
+        echo ${VMCTL_MSG18}
+        exit 1
+    fi
+    # 移動先ノードチェック
+    if [ "${_to}" ] ; then
+        crm_chk_node ${_to}
+    fi
+    # リソース移動可否チェック
+    crm_chk_can_move ${DOMAIN_LIST} ${_from} ${_to}
+    if [ ${?} -eq 1 ] ; then
+        echo ${VMCTL_MSG26}
+        exit 1
+    fi
+    # 移動先と稼動が同じなら何もしない
+    if [ "${_to}" = "${_from}" ] ; then
+        echo ${VMCTL_MSG21}
+        exit 0
+    fi
+    # リソース移動
+    crm_move_resource ${DOMAIN_LIST} ${_from} ${_to}
+}
+
+:<<'#_comment'
+関数名      : resource_unmove
+引数        : なし
+戻り値      : なし
+説明        : 指定ノードにリソースを移動する
+#_comment
+resource_unmove()
+{
+    chk_vm
+    chk_rsc 1 ${VMCTL_MSG15}
+    # リソース移動制約解除
+    crm_unmove_resource ${PRM_NM}_${DOMAIN_LIST}
+}
+
+:<<'#_comment'
+関数名      : resource_list
+引数        : なし
+戻り値      : なし
+説明        : リソース一覧を表示する
+#_comment
+resource_list()
+{
+    local _domain_name
+    local _output
+    local _tmp
+    local _idx=0
+    # ノード指定
+    if [ ${N_FLG} -eq 1 ] ; then
+        crm_chk_node ${NODE_NAME}
+        # ドメイン名取得
+        crm_get_node_rsclist ${NODE_NAME}
+        DOMAIN_LIST=${RET_VALUE}
+    # オプション未指定
+    elif [ ! "${DOMAIN_LIST}" ] ; then
+        get_domain
+        if [ "${RET_VALUE}" ] ; then
+            DOMAIN_LIST=${RET_VALUE}
+        fi
+    # ドメイン指定
+    else
+        chk_vm
+        chk_rsc 1 ${VMCTL_MSG15}
+    fi
+
+    # リソース情報取得
+    for _domain_name in ${DOMAIN_LIST}
+    do
+        # ドメイン名、リソース名設定
+        _tmp="${_domain_name} ${PRM_NM}_${_domain_name}"
+
+        # マイグレーション設定取得
+        get_migrate ${PRM_NM}_${_domain_name}
+        # マイグレーション設定
+        if [ "${RET_VALUE}" ] ; then
+            _tmp="${_tmp} ${RET_VALUE}"
+        else
+            _tmp="${_tmp} NONE"
+        fi
+        # 優先ノード設定取得
+        get_act_location ${_domain_name}
+        if [ "${RET_VALUE}" ] ; then
+            # 優先ノード設定
+            _tmp="${_tmp} ${RET_VALUE}"
+        else
+            _tmp="${_tmp} NONE"
+        fi
+
+        # 稼動ノード取得
+        crm_get_actrsc_node ${PRM_NM}_${_domain_name}
+        # 起動状態判定
+        if [ "${RET_VALUE}" ] ; then
+            # 起動ノード設定
+            _tmp="${_tmp} ${RET_VALUE}"
+        else
+            # 停止を設定
+            _tmp="${_tmp} Stopped"
+        fi
+
+        # 移動用制約の取得
+        get_move_location ${PRM_NM}_${_domain_name}
+        _tmp="${_tmp} ${RET_VALUE}"
+
+        _output="${_output} ${_tmp}"
+        _idx=$(expr ${_idx} + 1)
+    done
+    printf "%-25s %-25s %-28s %-25s %-27s %s\n" "ドメイン名" "リソース名" "マイグレーション" "優先ノード" "稼動ノード(状態)" "移動制約"
+    printf "%-20s %-20s %-20s %-20s %-20s %s\n" "--------------------" "--------------------" "--------------------" "--------------------" "--------------------" "--------------------"
+    printf "%-20s %-20s %-20s %-20s %-20s %s\n" ${_output}
+}
+
+:<<'#_comment'
+関数名      : location_move
+引数        : なし
+戻り値      : なし
+説明        : 稼動ノードにlocationを設定する
+#_comment
+location_move()
+{
+    local _domain_name
+    local _tmp_list
+    if [ ${B_FLG} -eq 1 ] ; then
+        crm_chk_node ${NODE_NAME}
+        # ドメイン名取得
+        get_domain
+        _tmp_list=${RET_VALUE}
+        # 指定ノードと同じlocationを持つリソースを特定
+        for _domain_name in ${_tmp_list}
+        do
+            get_act_location ${_domain_name}
+            if [ "${NODE_NAME}" = "${RET_VALUE}" ] ; then
+                DOMAIN_LIST="${DOMAIN_LIST} ${_domain_name}"
+            fi
+        done
+    else
+        chk_vm
+        chk_rsc 1 ${VMCTL_MSG15}
+    fi
+    if [ "${DOMAIN_LIST}" ] ; then
+        # location再設定
+        for _domain_name in ${DOMAIN_LIST}
+        do
+            # 稼動ノード取得
+            crm_get_actrsc_node ${PRM_NM}_${_domain_name}
+            if [ "${RET_VALUE}" ] ; then
+                crm_move_location ${_domain_name} ${RET_VALUE}
+            fi
+        done
+        # location更新
+        if [ "${DEL_ID_LIST}" ] ; then
+            crm_del_resource "${DEL_ID_LIST}"
+        fi
+        crm_upd_resource
+        rm_file ${TMP_CRMFILE}
+    fi
+}
+#############################################################################
+# main                                                                      #
+#############################################################################
+sleep 0.3
+# 多重起動チェック
+pid=$(pgrep vm-ctl)
+cnt=$(echo -n "${pid}" 2>/dev/null | grep -vw $$ 2>/dev/null | wc -l 2>/dev/null)
+if [ ${cnt} -ne 0 ] ; then
+	echo ${VMCTL_MSG17}
+	exit 1
+fi
+# 一時ファイル削除
+rm_file ${BACKUP_CRMFILE}
+rm_file ${TMP_CRMFILE}
+rm_file ${VMCTL_LOGFILE}
+
+CMD_ALL="${@}"
+NOW=$(date +"%Y/%m/%d %H:%M:%S")
+CMD_NAME="${1} ${2}"
+EXEC_FUNC=""
+MIGRATE=""
+STONITH=
+NODE_NAME=""
+RET_VALUE=""
+
+# vm-ctl.confチェック
+if [ ! -e ${VMCFG_DIR}/vm-ctl.conf ] ; then
+    echo ${VMCTL_MSG02}
+    exit 1
+fi
+# vm-ctl.conf読み込み
+. ${VMCFG_DIR}/vm-ctl.conf
+
+# コマンドオプションチェック
+shift 2
+# ドメイン名取得
+if [ "${1:0:1}" != "-" ] ; then
+	DOMAIN_LIST="${1}"
+	shift 1
+fi
+
+:<<'#_comment'
+a <activate_node>
+b <node_name> #bundle
+m <migrate_flag(on|off)>
+n <node_name>
+#_comment
+A_FLG=0
+B_FLG=0
+M_FLG=0
+N_FLG=0
+while getopts a:b:m:n: OPT
+do
+    case ${OPT} in
+        "a")
+            chk_opt
+            NODE_NAME="${OPTARG}"
+            A_FLG=$(expr ${A_FLG} + 1)
+            if [ ${A_FLG} -gt 1  ] ; then
+                usage
+            fi
+        ;;
+        "b")
+            chk_opt
+            NODE_NAME="${OPTARG}"
+            B_FLG=$(expr ${B_FLG} + 1)
+            if [ ${B_FLG} -gt 1  ] ; then
+                usage
+            fi
+        ;;
+        "m")
+            chk_opt
+            MIGRATE=${OPTARG}
+            M_FLG=$(expr ${M_FLG} + 1)
+            if [ ${M_FLG} -gt 1  ] ; then
+                usage
+            fi
+            if [ "${MIGRATE}" != "on" -a "${MIGRATE}" != "off" ] ; then
+                usage
+            fi
+        ;;
+        "n")
+            chk_opt
+            NODE_NAME="${OPTARG}"
+            N_FLG=$(expr ${N_FLG} + 1)
+            if [ ${N_FLG} -gt 1  ] ; then
+                usage
+            fi
+        ;;
+        *)
+            usage
+        ;;
+    esac
+done
+
+if [ ! "${DOMAIN_LIST}" ] ; then
+    shift $(expr ${OPTIND} - 1)
+    DOMAIN_LIST=${1}
+fi
+
+# コマンド解析＆チェック
+case ${CMD_NAME} in
+    "resource add")
+        if [ $((${B_FLG}|${N_FLG})) -ne 0 -o ${A_FLG} -ne 1 ] ; then
+            usage
+        fi
+        chk_domain_list
+        EXEC_FUNC="resource_add"
+    ;;
+    "resource delete")
+        if [ $((${A_FLG}|${B_FLG}|${M_FLG}|${N_FLG})) -ne 0  ] ; then
+            usage
+        fi
+        chk_domain_list
+        EXEC_FUNC="resource_delete"
+    ;;
+    "resource move")
+        if [ $((${A_FLG}|${B_FLG}|${M_FLG})) -ne 0  ] ; then
+            usage
+        fi
+        chk_domain
+        EXEC_FUNC="resource_move"
+    ;;
+    "resource unmove")
+        if [ $((${A_FLG}|${B_FLG}|${M_FLG}|${N_FLG})) -ne 0  ] ; then
+            usage
+        fi
+        chk_domain
+        EXEC_FUNC="resource_unmove"
+    ;;
+    "resource start")
+        if [ $((${A_FLG}|${B_FLG}|${M_FLG}|${N_FLG})) -ne 0  ] ; then
+            usage
+        fi
+        chk_domain_list
+        EXEC_FUNC="resource_start"
+    ;;
+    "resource stop")
+        if [ $((${A_FLG}|${B_FLG}|${M_FLG}|${N_FLG})) -ne 0  ] ; then
+            usage
+        fi
+        chk_domain_list
+        EXEC_FUNC="resource_stop"
+    ;;
+    "resource list")
+        if [ $((${A_FLG}|${B_FLG}|${M_FLG})) -ne 0  ] ; then
+            usage
+        fi
+        if [ ${N_FLG} -eq 1 -a "${DOMAIN_LIST}" ] ; then
+            usage
+        fi
+        if [ "${DOMAIN_LIST}" ] ; then
+            chk_domain
+        fi
+        EXEC_FUNC="resource_list"
+    ;;
+    "location move")
+        if [ $((${A_FLG}|${M_FLG}|${N_FLG})) -ne 0  ] ; then
+            usage
+        fi
+        if [ ${B_FLG} -eq 1 -a "${DOMAIN_LIST}" ] ; then
+            usage
+        fi
+        if [ ${B_FLG} -eq 0 ] ; then
+            chk_domain
+        fi
+        EXEC_FUNC="location_move"
+    ;;
+    *)
+        usage
+    ;;
+esac
+
+# 空白削除＆重複内容削除
+DOMAIN_LIST=$(echo ${DOMAIN_LIST} | sed -e 's/ *//g')
+DOMAIN_LIST=${DOMAIN_LIST//,/\\n}
+DOMAIN_LIST=$(echo -e ${DOMAIN_LIST} | sort | uniq)
+#DOMAIN_LIST=${DOMAIN_LIST//\\n/ }
+
+# 現在のcrmファイルバックアップ
+chk_cluster
+crm configure save ${BACKUP_CRMFILE}<<EOF>${VMCTL_LOGFILE} 2>&1
+yes
+EOF
+if [ ${?} -ne 0 ] ; then
+    echo ${VMCTL_MSG04}
+    cat ${VMCTL_LOGFILE}
+    exit 1
+fi
+BACKUP_VAL=$(cat ${BACKUP_CRMFILE} 2>/dev/null)
+#メタデータ登録
+echo "# ${NOW} vm-ctl ${CMD_ALL}" > ${BACKUP_CRMFILE}
+echo -e "${BACKUP_VAL}" >> ${BACKUP_CRMFILE}
+
+# リソースオペレーション定数チェック
+[ "${EXEC_FUNC}" = "resource_add" -o "${EXEC_FUNC}" = "location_move" ] && chk_rsc_config
+
+# vmctl実行
+${EXEC_FUNC}
+
+exit 0
+

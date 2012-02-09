@@ -36,8 +36,6 @@ VMCFG_DIR="/etc"
 BACKUP_CRMFILE="/var/run/.vm-ctl.crm.bk"
 TMP_CRMFILE="/tmp/.vm-ctl.crm"
 VMCTL_LOGFILE="/tmp/.vm-ctl.log"
-PLUS_INFINITY="1000000"
-MINUS_INFINITY="-1000000"
 DEF_VALUE=""
 DC_NODE=""
 DEL_ID_LIST=""
@@ -132,7 +130,7 @@ chk_vm()
     local _cnt
     for _domain_name in ${DOMAIN_LIST}
     do
-        _cnt=$(virsh list --all 2>/dev/null | grep -w ${_domain_name} 2>/dev/null | wc -l 2>/dev/null)
+        _cnt=$(virsh list --all 2>/dev/null | grep "[[:blank:]]${_domain_name}[[:blank:]]" 2>/dev/null | wc -l 2>/dev/null)
         if [ ${_cnt} -eq 0 ] ; then
             echo ${VMCTL_MSG03}
             exit 1
@@ -154,7 +152,7 @@ chk_rsc()
     local _cnt
     for _domain_name in ${DOMAIN_LIST}
     do
-        _cnt=$(grep "primitive ${PRM_NM}_${_domain_name}" ${BACKUP_CRMFILE} 2>/dev/null | wc -l 2>/dev/null)
+        _cnt=$(grep "primitive ${PRM_NM}_${_domain_name}[[:blank:]]" ${BACKUP_CRMFILE} 2>/dev/null | wc -l 2>/dev/null)
         if [ ${_cnt} -ne ${1} ] ; then
             echo ${2}
             exit 1
@@ -238,7 +236,7 @@ chk_stonith()
 chk_crm_error()
 {
     local _cnt
-    _cnt=$(egrep 'ERROR|error' ${VMCTL_LOGFILE} 2>/dev/null | wc -l 2>/dev/null)
+    _cnt=$(egrep "(ERROR|error): " ${VMCTL_LOGFILE} 2>/dev/null | wc -l 2>/dev/null)
     if [ ${_cnt} -ne 0 -o ${1} -ne 0 ] ; then
         echo ${VMCTL_MSG05}
         cat ${VMCTL_LOGFILE}
@@ -415,7 +413,7 @@ chk_rsc_config()
 	fi
 
 	if [ ! "${vm_start_op}" -o ${#vm_start_op[@]} -ne 3 ] ; then
-                DEF_VALUE="vm_start_op=(0 120s restart)"
+                DEF_VALUE="vm_start_op=(0 90s restart)"
                 eval echo "${VMCTL_MSG22}"
                 eval ${DEF_VALUE}
 	fi
@@ -529,7 +527,7 @@ get_migrate()
     while read _line
     do
         _migrate=$(echo ${_line} 2>/dev/null        \
-                | grep "primitive ${1}" 2>/dev/null \
+                | grep "primitive ${1}[[:blank:]]" 2>/dev/null \
                 | sed -e 's/.*allow-migrate=\"\(true\|false\)\" .*/\1/' 2>/dev/null)
         if [ "${_migrate}" ] ; then
             if [ "${_migrate}" = "true" ] ; then
@@ -556,7 +554,7 @@ get_act_location()
     while read _line
     do
         _act=$(echo ${_line} 2>/dev/null        \
-                | grep "location ${LOC_NM}_${1}.*ACT" 2>/dev/null \
+                | grep "location ${LOC_NM}_.*_ACT ${PRM_NM}_${1}[[:blank:]]" 2>/dev/null \
                 | awk '{print $5}')
         if [ "${_act}" ] ; then
             RET_VALUE=${_act}
@@ -578,9 +576,10 @@ get_move_location()
     while read _line
     do
         _migrate=$(echo ${_line} 2>/dev/null        \
-                | egrep "location cli-standby-${1}|location cli-prefer-${1}" 2>/dev/null)
+                | egrep "^location cli-(standby|prefer)-${1}[[:blank:]]" 2>/dev/null)
         if [ ${?} -eq 0 ] ; then
             RET_VALUE="yes"
+            break
         fi
     done < ${BACKUP_CRMFILE}
 }
@@ -930,7 +929,7 @@ crm_get_actrsc_node()
     RET_VALUE=""
     chk_cluster
     RET_VALUE=$(crm status inactive 2>/dev/null     \
-            | grep ${1}.*VirtualDomain 2>/dev/null  \
+            | grep "${1}[[:blank:]].*VirtualDomain" 2>/dev/null \
             | awk '{print $4}' 2>/dev/null)
 }
 
@@ -950,7 +949,7 @@ crm_get_node_rsclist()
     RET_VALUE=""
     chk_cluster
     RET_VALUE=$(crm status inactive 2>/dev/null     \
-            | grep VirtualDomain.*${1} 2>/dev/null  \
+            | egrep "VirtualDomain.*[[:blank:]]${1}($|[[:blank:]])" 2>/dev/null \
             | awk '{print $1}' 2>/dev/null          \
             | awk '{print substr($1,length("'${PRM_NM}'_")+1)}' 2>/dev/null)
 }
@@ -1006,41 +1005,48 @@ crm_chk_can_move()
     local _scores
     local _flg=0
 
+    chk_cluster
     if [ ${3} ] ; then
-        chk_cluster
-        _cnt=$(crm status 2>/dev/null                   \
-                | grep -v VirtualDomain 2>/dev/null     \
-                | grep "Online" 2>/dev/null             \
-                | grep ${3} 2>/dev/null                 \
-                | wc -l 2>/dev/null)
-        if [ ${_cnt} -eq 0 ] ; then
-            echo ${VMCTL_MSG14}
-            return 1
-        fi
+        _cnt=$(crm status bynode 2>/dev/null \
+            | egrep "^Node ${3}([[:blank:]].*|): online$" 2>/dev/null \
+            | wc -l 2>/dev/null)
+    else
+        _cnt=$(crm status bynode 2>/dev/null \
+            | grep "^Node .*: online$" 2>/dev/null \
+            | egrep -v "^Node ${2}(|:)[[:blank:]]" 2>/dev/null \
+            | wc -l 2>/dev/null)
     fi
+    if [ ${_cnt} -eq 0 ] ; then
+        echo ${VMCTL_MSG14}
+        return 1
+    fi
+
     chk_cluster
     crm status inactive 2>/dev/null     \
-            | grep ${PRM_NM}_${1}.*VirtualDomain 2>/dev/null  \
-            | egrep 'unmanaged' >/dev/null 2>&1
+            | grep "${PRM_NM}_${1}[[:blank:]].*VirtualDomain" 2>/dev/null \
+            | egrep '[[:blank:]]\(unmanaged\)' >/dev/null 2>&1
     if [ ${?} -eq 0 ] ; then
         echo ${VMCTL_MSG25}
         return 1
     fi
-    chk_cluster
-    _scores=$(crm configure ptest scores 2>/dev/null \
-        | grep "native_color: ${PRM_NM}_${1} allocation score on ${3}" 2>/dev/null \
-        | grep -v ${2} 2>/dev/null \
-        | awk '{print $7}' 2>/dev/null)
 
+    chk_cluster
     if [ ${3} ] ; then
-        if [ "${_scores}" = "${MINUS_INFINITY}" ] ; then
+        _scores=$(crm configure ptest scores 2>/dev/null \
+            | grep "native_color: ${PRM_NM}_${1} allocation score on ${3}:" 2>/dev/null \
+            | awk '{print $7}' 2>/dev/null)
+        if [ "${_scores}" = "-1000000" -o "${_scores}" = "-INFINITY" ] ; then
             eval echo "${VMCTL_MSG19}"
             return 1
         fi
     else
+        _scores=$(crm configure ptest scores 2>/dev/null \
+            | grep "native_color: ${PRM_NM}_${1} allocation score on " 2>/dev/null \
+            | grep -v "[[:blank:]]${2}:" 2>/dev/null \
+            | awk '{print $7}' 2>/dev/null)
         for _score in ${_scores}
         do
-            if [ "${_score}" != "${MINUS_INFINITY}" ] ; then
+            if [ "${_score}" != "-1000000" -a "${_score}" != "-INFINITY" ] ; then
                 _flg=1
             fi
         done
@@ -1144,7 +1150,7 @@ crm_move_resource()
         fi
         crm_get_actrsc_node ${PRM_NM}_${1}
         if [ ! ${3} ] ; then
-            if [ ${RET_VALUE} -a "${RET_VALUE}" != "${2}" ] ; then
+            if [ "${RET_VALUE}" -a "${RET_VALUE}" != "${2}" ] ; then
                 break
             fi
         else
